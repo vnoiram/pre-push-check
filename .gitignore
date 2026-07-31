@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated installation files
+hooks/
+
+# Local configuration and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Common build outputs
+build/
+dist/
+target/
+node_modules/
+bin/
+obj/
