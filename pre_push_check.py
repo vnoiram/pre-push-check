@@ -20,10 +20,10 @@ HOOK_MARKER = "# managed-by: pre-push-check"
 DEFAULT_HOOK = "pre-push"
 
 IGNORE_FILE_NAME = ".pre-push-check-ignore.md"
-IGNORE_TABLE_HEADER = "| 済 | ID | 重大度 | 種別 | 検出箇所 | 内容 |"
-IGNORE_TABLE_SEP = "|---|---|---|---|---|---|"
+IGNORE_TABLE_HEADER = "| 済 | ID | 重大度 | 種別 | 検出箇所 | 説明 | 検出内容 |"
+IGNORE_TABLE_SEP = "|---|---|---|---|---|---|---|"
 IGNORE_ROW_PATTERN = re.compile(
-    r"^\|\s*\[([ xX])\]\s*\|\s*([0-9a-f]{12})\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*(.*?)\s*\|\s*$"
+    r"^\|\s*\[([ xX])\]\s*\|\s*([0-9a-f]{12})\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*(.*?)\s*\|\s*$"
 )
 # Kinds with no specific location/content to anchor a fingerprint to (a plain yes/no repo-state
 # check, not "these files/this file are the reason"). "command" in particular only carries
@@ -106,6 +106,7 @@ class Finding:
     location: str
     message: str
     recommendation: str
+    detail: str = ""
 
 
 @dataclass
@@ -145,7 +146,7 @@ class Report:
 
 def finding_fingerprint(finding: Finding) -> str:
     digest = hashlib.sha1(
-        f"{finding.kind}\x1f{finding.location}\x1f{finding.message}".encode("utf-8")
+        f"{finding.kind}\x1f{finding.location}\x1f{finding.message}\x1f{finding.detail}".encode("utf-8")
     ).hexdigest()
     return digest[:12]
 
@@ -162,20 +163,20 @@ def escape_table_cell(text: str) -> str:
     return text.replace("|", "\\|")
 
 
-def parse_ignore_table(path: Path) -> dict[str, tuple[bool, str, str, str, str]]:
-    rows: dict[str, tuple[bool, str, str, str, str]] = {}
+def parse_ignore_table(path: Path) -> dict[str, tuple[bool, str, str, str, str, str]]:
+    rows: dict[str, tuple[bool, str, str, str, str, str]] = {}
     for line in read_text_if_exists(path).splitlines():
         match = IGNORE_ROW_PATTERN.match(line)
         if not match:
             continue
         checked = match.group(1).lower() == "x"
         fingerprint = match.group(2)
-        severity, kind, location, message = (g.strip() for g in match.groups()[2:])
-        rows[fingerprint] = (checked, severity, kind, location, message)
+        severity, kind, location, message, detail = (g.strip() for g in match.groups()[2:])
+        rows[fingerprint] = (checked, severity, kind, location, message, detail)
     return rows
 
 
-def render_ignore_table(rows: dict[str, tuple[bool, str, str, str, str]]) -> str:
+def render_ignore_table(rows: dict[str, tuple[bool, str, str, str, str, str]]) -> str:
     lines = [
         "# pre-push-check 誤検知一覧",
         "",
@@ -186,11 +187,11 @@ def render_ignore_table(rows: dict[str, tuple[bool, str, str, str, str]]) -> str
         IGNORE_TABLE_HEADER,
         IGNORE_TABLE_SEP,
     ]
-    for fingerprint, (checked, severity, kind, location, message) in rows.items():
+    for fingerprint, (checked, severity, kind, location, message, detail) in rows.items():
         box = "[x]" if checked else "[ ]"
         lines.append(
             f"| {box} | {fingerprint} | {escape_table_cell(severity)} | {escape_table_cell(kind)} | "
-            f"{escape_table_cell(location)} | {escape_table_cell(message)} |"
+            f"{escape_table_cell(location)} | {escape_table_cell(message)} | {escape_table_cell(detail)} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -217,7 +218,14 @@ def sync_ignore_file(repo: Path, findings: list[Finding]) -> tuple[dict[str, boo
     for finding in suppressible:
         fingerprint = finding_fingerprint(finding)
         if fingerprint not in rows:
-            rows[fingerprint] = (False, finding.severity, finding.kind, finding.location, finding.message)
+            rows[fingerprint] = (
+                False,
+                finding.severity,
+                finding.kind,
+                finding.location,
+                finding.message,
+                finding.detail,
+            )
             added += 1
     if added or removed:
         if rows:
@@ -395,17 +403,17 @@ def scan_worktree(report: Report) -> None:
             if SECRET_PATTERN.search(line):
                 secret_hits += 1
                 report.findings.append(
-                    Finding("Blocker", "secret", location, "Possible secret in tracked file.", "Remove it and rotate the credential if real.")
+                    Finding("Blocker", "secret", location, "Possible secret in tracked file.", "Remove it and rotate the credential if real.", line.strip())
                 )
             if CONFLICT_PATTERN.search(line):
                 conflict_hits += 1
                 report.findings.append(
-                    Finding("Blocker", "conflict", location, "Conflict marker remains.", "Resolve the merge conflict before pushing.")
+                    Finding("Blocker", "conflict", location, "Conflict marker remains.", "Resolve the merge conflict before pushing.", line.strip())
                 )
             if path.suffix in DEBUG_EXTENSIONS and "pre-push-check: ignore-debug" not in line and DEBUG_PATTERN.search(line):
                 debug_hits += 1
                 report.findings.append(
-                    Finding("Warning", "debug", location, "Possible debug remnant.", "Confirm it is intentional or remove it.")
+                    Finding("Warning", "debug", location, "Possible debug remnant.", "Confirm it is intentional or remove it.", line.strip())
                 )
     report.checks.append(CheckRun("scan tracked files for secrets", "ok", f"hits={secret_hits}"))
     report.checks.append(CheckRun("scan tracked files for conflict markers", "ok", f"hits={conflict_hits}"))
@@ -571,7 +579,7 @@ def scan_local_paths(report: Report) -> None:
             if LOCAL_PATH_PATTERN.search(line):
                 hits += 1
                 report.findings.append(
-                    Finding("Warning", "local-path", f"{rel}:{lineno}", "Local absolute path appears in a tracked file.", "Replace it with a relative path or configuration.")
+                    Finding("Warning", "local-path", f"{rel}:{lineno}", "Local absolute path appears in a tracked file.", "Replace it with a relative path or configuration.", line.strip())
                 )
     report.checks.append(CheckRun("scan tracked files for local paths", "ok", f"hits={hits}"))
 
@@ -768,11 +776,11 @@ def scan_ci(report: Report) -> None:
             stripped = line.strip()
             location = f"{workflow.relative_to(report.context.repo).as_posix()}:{lineno}"
             if "pull_request_target" in stripped:
-                report.findings.append(Finding("Warning", "ci", location, "`pull_request_target` is used.", "Confirm this is safe for untrusted PRs."))
+                report.findings.append(Finding("Warning", "ci", location, "`pull_request_target` is used.", "Confirm this is safe for untrusted PRs.", stripped))
             if re.search(r"uses:\s+[^@\s]+/[^@\s]+@v?\d+", stripped):
-                report.findings.append(Finding("Warning", "ci", location, "Third-party action is pinned only by tag.", "Pin actions to commit SHA for stronger supply-chain safety."))
+                report.findings.append(Finding("Warning", "ci", location, "Third-party action is pinned only by tag.", "Pin actions to commit SHA for stronger supply-chain safety.", stripped))
             if re.search(r"echo\s+.*secrets\.", stripped, re.IGNORECASE):
-                report.findings.append(Finding("Blocker", "ci-secret", location, "Workflow may echo a secret.", "Do not print secrets in CI logs."))
+                report.findings.append(Finding("Blocker", "ci-secret", location, "Workflow may echo a secret.", "Do not print secrets in CI logs.", stripped))
             command = safe_ci_command_from_line(stripped)
             if command:
                 workflow_commands.append(command)
@@ -952,12 +960,12 @@ def print_report(
         print("working tree: dirty")
     print()
     if report.findings:
-        print("| Severity | Kind | Location | Detail | Recommendation |")
-        print("|---|---|---|---|---|")
+        print("| Severity | Kind | Location | Detail | Matched | Recommendation |")
+        print("|---|---|---|---|---|---|")
         for finding in report.findings:
             print(
                 f"| {finding.severity} | {finding.kind} | `{finding.location}` | "
-                f"{finding.message} | {finding.recommendation} |"
+                f"{finding.message} | {finding.detail} | {finding.recommendation} |"
             )
     else:
         print("No findings.")
@@ -977,7 +985,8 @@ def print_report(
     if suppressed:
         print(f"suppressed as false positive ({IGNORE_FILE_NAME}): {len(suppressed)}")
         for finding in suppressed:
-            print(f"- {finding.severity} {finding.kind} `{finding.location}`: {finding.message}")
+            suffix = f" ({finding.detail})" if finding.detail else ""
+            print(f"- {finding.severity} {finding.kind} `{finding.location}`: {finding.message}{suffix}")
 
 
 def install_global_hook() -> int:

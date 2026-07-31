@@ -44,14 +44,23 @@ Every run writes `.pre-push-check-ignore.md` at the target repository root and a
 repository's `.gitignore` automatically. This is the one exception to the report-only default:
 the tool always maintains this file so persistent false positives don't block `git push` forever.
 
-Each finding is fingerprinted from its `kind` + `location` (`file:line`) + `message`. New findings
-are appended to the table as an unchecked row (`[ ]`). Edit the file and change the box to `[x]`
+Each finding is fingerprinted from its `kind` + `location` (`file:line`) + `message` + the actual
+matched content (e.g. the literal source line a secret/debug/local-path regex matched). The table
+records that matched content too, so a row reads like:
+
+```
+| [ ] | f8d29dc8cdf8 | Blocker | secret | foobar.yaml:1 | Possible secret in tracked file. | api_key = "SECRET-KEY-HERE" |
+```
+
+New findings are appended as an unchecked row (`[ ]`). Edit the file and change the box to `[x]`
 to mark a row as a false positive; on the next run that exact finding is excluded from the report
 and no longer counts toward the Blocker verdict.
 
-Because the fingerprint includes the line number, moving code so the line shifts produces a new
-fingerprint and the finding reappears (unchecked) rather than staying silently suppressed. This is
-intentional: it favors re-review over silently trusting a stale suppression.
+Because the fingerprint includes the line number and the matched content, moving code so the line
+shifts, or editing that same line to a different value, produces a new fingerprint and the finding
+reappears (unchecked) rather than staying silently suppressed. This is intentional: it favors
+re-review over silently trusting a stale suppression — checking off a `foobar.yaml:1` false
+positive does not exempt a real secret introduced later at that same line.
 
 Rows for findings that no longer occur (fixed in code, so the same fingerprint is not produced by
 the current run) are removed automatically on the next run, keeping the table limited to findings
