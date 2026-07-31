@@ -984,9 +984,6 @@ def print_report(
         print(f"note: {removed} resolved finding(s) removed from {IGNORE_FILE_NAME} (no longer detected).")
     if suppressed:
         print(f"suppressed as false positive ({IGNORE_FILE_NAME}): {len(suppressed)}")
-        for finding in suppressed:
-            suffix = f" ({finding.detail})" if finding.detail else ""
-            print(f"- {finding.severity} {finding.kind} `{finding.location}`: {finding.message}{suffix}")
 
 
 def install_global_hook() -> int:
