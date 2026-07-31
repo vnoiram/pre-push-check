@@ -57,15 +57,18 @@ Rows for findings that no longer occur (fixed in code, so the same fingerprint i
 the current run) are removed automatically on the next run, keeping the table limited to findings
 that are still present. If every row is removed, the file itself is deleted.
 
-Not every finding is suppressible. Kinds whose message describes repo-wide *current state* rather
-than a specific, content-anchored instance — `dirty-worktree`, `upstream`, `remote`, `command`, and
-`format` — are never written to the table and always reported at full severity, regardless of any
-past checkbox. These do not represent a heuristic that can misfire the same way twice: a failing
-test or an uncommitted file is a fact about the current push, not a detector guessing wrong, so
-checking one off would silently hide a *different* future failure/uncommitted file that happens to
-produce the same generic message (e.g. any `pytest` failure has the same "failed with exit code 1"
-text regardless of which test broke). `dirty-worktree` is reported as `Note` rather than `Warning`
-for the same reason: it should stay visible every run without inviting a one-time dismissal.
+Findings with real content point at the specific thing that triggered them — `dirty-worktree` lists
+the actual changed paths (e.g. `a.py, b.py`) and a failed `gofmt -l` lists the actual unformatted Go
+files — so their location/fingerprint changes whenever the underlying content changes. Checking one
+off only suppresses that exact set; a different dirty file or a different unformatted file produces
+a new fingerprint and is reported again. `dirty-worktree` is reported as `Note` rather than
+`Warning` since it should stay visible every run rather than invite a one-time dismissal.
+
+A few kinds have no specific content to anchor to — a plain yes/no repo-state check, not "these
+files are the reason" — and are never written to the table, always reported at full severity
+regardless of any past checkbox: `upstream`, `remote`, and `command`. `command` in particular only
+carries `` `<label>` failed with exit code N ``, not which assertion or file actually failed, so a
+checked-off row would silently swallow a different, unrelated future failure of the same command.
 
 The file is local-only (gitignored) — it records this machine's judgment calls, not a
 team-wide policy.

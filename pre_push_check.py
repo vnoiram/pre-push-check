@@ -25,12 +25,12 @@ IGNORE_TABLE_SEP = "|---|---|---|---|---|---|"
 IGNORE_ROW_PATTERN = re.compile(
     r"^\|\s*\[([ xX])\]\s*\|\s*([0-9a-f]{12})\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*(.*?)\s*\|\s*$"
 )
-# Kinds whose location/message describe repo-wide *current state* rather than a specific,
-# content-anchored instance. Their message text does not change with what is actually wrong
-# (e.g. "command" is only "<label> failed with exit code N", not which assertion failed), so a
-# checked-off row would silently swallow every future, unrelated occurrence. These are always
-# reported fresh and never enter the ignore table.
-NON_SUPPRESSIBLE_KINDS = {"dirty-worktree", "upstream", "remote", "command", "format"}
+# Kinds with no specific location/content to anchor a fingerprint to (a plain yes/no repo-state
+# check, not "these files/this file are the reason"). "command" in particular only carries
+# "<label> failed with exit code N", not which assertion or file actually failed, so a checked-off
+# row would silently swallow a different, unrelated future failure of the same command. These are
+# always reported fresh and never enter the ignore table.
+NON_SUPPRESSIBLE_KINDS = {"upstream", "remote", "command"}
 
 SECRET_PATTERN = re.compile(
     r"(AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
@@ -432,8 +432,14 @@ def scan_history(report: Report) -> None:
 
 def scan_git_metadata(report: Report) -> None:
     if report.context.status:
+        # Use raw (unstripped) output: report.context.status has been .strip()-ed, which eats the
+        # leading status-code column of the first line and misaligns the fixed-width slice below.
+        raw_status = git(report.context.repo, ["status", "--short"]).stdout
+        dirty_paths = ", ".join(
+            line[3:].strip() for line in raw_status.splitlines() if len(line) > 3
+        ) or "."
         report.findings.append(
-            Finding("Note", "dirty-worktree", ".", "Working tree has uncommitted changes.", "Confirm they are intentionally excluded from this push.")
+            Finding("Note", "dirty-worktree", dirty_paths, "Working tree has uncommitted changes.", "Confirm they are intentionally excluded from this push.")
         )
     if not report.context.upstream:
         report.findings.append(
@@ -656,7 +662,8 @@ def run_go_checks(report: Report) -> None:
             status = "ok" if proc.returncode == 0 and not proc.stdout.strip() else "failed"
             report.checks.append(CheckRun("gofmt -l", status, proc.stdout.strip()))
             if status == "failed":
-                report.findings.append(Finding("Blocker", "format", ".", "Go files are not gofmt-formatted.", "Run gofmt before pushing."))
+                unformatted = ", ".join(proc.stdout.split()) or "."
+                report.findings.append(Finding("Blocker", "format", unformatted, "Go files are not gofmt-formatted.", "Run gofmt before pushing."))
     add_command_check(report, "go vet ./...", ["go", "vet", "./..."], repo)
     add_command_check(report, "go test ./...", ["go", "test", "./..."], repo)
 
