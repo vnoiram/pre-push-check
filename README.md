@@ -38,6 +38,38 @@ Stack-specific checks are run only when the repository declares the matching sta
 
 Skipped checks are listed with the reason. Missing tools are not installed automatically.
 
+## Suppressing False Positives
+
+Every run writes `.pre-push-check-ignore.md` at the target repository root and adds it to that
+repository's `.gitignore` automatically. This is the one exception to the report-only default:
+the tool always maintains this file so persistent false positives don't block `git push` forever.
+
+Each finding is fingerprinted from its `kind` + `location` (`file:line`) + `message`. New findings
+are appended to the table as an unchecked row (`[ ]`). Edit the file and change the box to `[x]`
+to mark a row as a false positive; on the next run that exact finding is excluded from the report
+and no longer counts toward the Blocker verdict.
+
+Because the fingerprint includes the line number, moving code so the line shifts produces a new
+fingerprint and the finding reappears (unchecked) rather than staying silently suppressed. This is
+intentional: it favors re-review over silently trusting a stale suppression.
+
+Rows for findings that no longer occur (fixed in code, so the same fingerprint is not produced by
+the current run) are removed automatically on the next run, keeping the table limited to findings
+that are still present. If every row is removed, the file itself is deleted.
+
+Not every finding is suppressible. Kinds whose message describes repo-wide *current state* rather
+than a specific, content-anchored instance — `dirty-worktree`, `upstream`, `remote`, `command`, and
+`format` — are never written to the table and always reported at full severity, regardless of any
+past checkbox. These do not represent a heuristic that can misfire the same way twice: a failing
+test or an uncommitted file is a fact about the current push, not a detector guessing wrong, so
+checking one off would silently hide a *different* future failure/uncommitted file that happens to
+produce the same generic message (e.g. any `pytest` failure has the same "failed with exit code 1"
+text regardless of which test broke). `dirty-worktree` is reported as `Note` rather than `Warning`
+for the same reason: it should stay visible every run without inviting a one-time dismissal.
+
+The file is local-only (gitignored) — it records this machine's judgment calls, not a
+team-wide policy.
+
 ## Requirements
 
 Required:

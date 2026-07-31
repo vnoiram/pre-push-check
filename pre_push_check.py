@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import re
 import shlex
@@ -18,9 +19,22 @@ TOOL_DIR = Path(__file__).resolve().parent
 HOOK_MARKER = "# managed-by: pre-push-check"
 DEFAULT_HOOK = "pre-push"
 
+IGNORE_FILE_NAME = ".pre-push-check-ignore.md"
+IGNORE_TABLE_HEADER = "| 済 | ID | 重大度 | 種別 | 検出箇所 | 内容 |"
+IGNORE_TABLE_SEP = "|---|---|---|---|---|---|"
+IGNORE_ROW_PATTERN = re.compile(
+    r"^\|\s*\[([ xX])\]\s*\|\s*([0-9a-f]{12})\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*(.*?)\s*\|\s*$"
+)
+# Kinds whose location/message describe repo-wide *current state* rather than a specific,
+# content-anchored instance. Their message text does not change with what is actually wrong
+# (e.g. "command" is only "<label> failed with exit code N", not which assertion failed), so a
+# checked-off row would silently swallow every future, unrelated occurrence. These are always
+# reported fresh and never enter the ignore table.
+NON_SUPPRESSIBLE_KINDS = {"dirty-worktree", "upstream", "remote", "command", "format"}
+
 SECRET_PATTERN = re.compile(
     r"(AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"api[_-]?key\s*[:=]|password\s*[:=]|token\s*[:=])",
+    r"(?:api[_-]?key|password|token)\s*(?::(?!=)|=(?!=)))",
     re.IGNORECASE,
 )
 CONFLICT_PATTERN = re.compile(r"^(<<<<<<<|=======|>>>>>>>)")
@@ -127,6 +141,91 @@ class Report:
         if any(f.severity == "Warning" for f in self.findings):
             return "要判断（Warning・確認事項あり）"
         return "PUSH 可"
+
+
+def finding_fingerprint(finding: Finding) -> str:
+    digest = hashlib.sha1(
+        f"{finding.kind}\x1f{finding.location}\x1f{finding.message}".encode("utf-8")
+    ).hexdigest()
+    return digest[:12]
+
+
+def is_suppressible(finding: Finding) -> bool:
+    return finding.kind not in NON_SUPPRESSIBLE_KINDS
+
+
+def ignore_file_path(repo: Path) -> Path:
+    return repo / IGNORE_FILE_NAME
+
+
+def escape_table_cell(text: str) -> str:
+    return text.replace("|", "\\|")
+
+
+def parse_ignore_table(path: Path) -> dict[str, tuple[bool, str, str, str, str]]:
+    rows: dict[str, tuple[bool, str, str, str, str]] = {}
+    for line in read_text_if_exists(path).splitlines():
+        match = IGNORE_ROW_PATTERN.match(line)
+        if not match:
+            continue
+        checked = match.group(1).lower() == "x"
+        fingerprint = match.group(2)
+        severity, kind, location, message = (g.strip() for g in match.groups()[2:])
+        rows[fingerprint] = (checked, severity, kind, location, message)
+    return rows
+
+
+def render_ignore_table(rows: dict[str, tuple[bool, str, str, str, str]]) -> str:
+    lines = [
+        "# pre-push-check 誤検知一覧",
+        "",
+        "このファイルは pre-push-check が自動生成・更新します。",
+        "誤検知だと判断した行の `[ ]` を `[x]` に変更すると、以後その指摘は無視されます。",
+        "このファイルは `.gitignore` に自動追加されるため、リポジトリには含まれません（ローカル限定の判断です）。",
+        "",
+        IGNORE_TABLE_HEADER,
+        IGNORE_TABLE_SEP,
+    ]
+    for fingerprint, (checked, severity, kind, location, message) in rows.items():
+        box = "[x]" if checked else "[ ]"
+        lines.append(
+            f"| {box} | {fingerprint} | {escape_table_cell(severity)} | {escape_table_cell(kind)} | "
+            f"{escape_table_cell(location)} | {escape_table_cell(message)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def ensure_gitignore_entry(repo: Path) -> None:
+    gitignore = repo / ".gitignore"
+    text = read_text_if_exists(gitignore)
+    if any(line.strip() == IGNORE_FILE_NAME for line in text.splitlines()):
+        return
+    prefix = "" if not text or text.endswith("\n") else "\n"
+    with gitignore.open("a", encoding="utf-8") as fh:
+        fh.write(f"{prefix}{IGNORE_FILE_NAME}\n")
+
+
+def sync_ignore_file(repo: Path, findings: list[Finding]) -> tuple[dict[str, bool], int, int]:
+    path = ignore_file_path(repo)
+    existing_rows = parse_ignore_table(path)
+    suppressible = [f for f in findings if is_suppressible(f)]
+    current_fingerprints = {finding_fingerprint(f) for f in suppressible}
+    rows = {fp: row for fp, row in existing_rows.items() if fp in current_fingerprints}
+    removed = len(existing_rows) - len(rows)
+    added = 0
+    for finding in suppressible:
+        fingerprint = finding_fingerprint(finding)
+        if fingerprint not in rows:
+            rows[fingerprint] = (False, finding.severity, finding.kind, finding.location, finding.message)
+            added += 1
+    if added or removed:
+        if rows:
+            path.write_text(render_ignore_table(rows), encoding="utf-8")
+        elif path.exists():
+            path.unlink()
+    ensure_gitignore_entry(repo)
+    return {fingerprint: row[0] for fingerprint, row in rows.items()}, added, removed
 
 
 def run(
@@ -334,7 +433,7 @@ def scan_history(report: Report) -> None:
 def scan_git_metadata(report: Report) -> None:
     if report.context.status:
         report.findings.append(
-            Finding("Warning", "dirty-worktree", ".", "Working tree has uncommitted changes.", "Confirm they are intentionally excluded from this push.")
+            Finding("Note", "dirty-worktree", ".", "Working tree has uncommitted changes.", "Confirm they are intentionally excluded from this push.")
         )
     if not report.context.upstream:
         report.findings.append(
@@ -446,10 +545,11 @@ def scan_gitignore_coverage(report: Report) -> None:
         report.findings.append(
             Finding("Note", ".gitignore", ".gitignore", f"Common ignore patterns are missing: {shown}.", "Add patterns that fit this repository's stack.")
         )
-    if any(name.startswith(".env") for name in files):
-        report.findings.append(
-            Finding("Blocker", ".env", ".env*", "An environment file is tracked.", "Remove it from Git and rotate any real credentials.")
-        )
+    for name in files:
+        if name.startswith(".env"):
+            report.findings.append(
+                Finding("Blocker", ".env", name, "An environment file is tracked.", "Remove it from Git and rotate any real credentials.")
+            )
     report.checks.append(CheckRun("inspect .gitignore coverage", "ok", f"missing={len(missing)}"))
 
 
@@ -826,7 +926,12 @@ def make_report(repo: Path) -> Report:
     return report
 
 
-def print_report(report: Report) -> None:
+def print_report(
+    report: Report,
+    suppressed: list[Finding] | None = None,
+    added: int = 0,
+    removed: int = 0,
+) -> None:
     ctx = report.context
     print(report.verdict)
     print()
@@ -854,6 +959,18 @@ def print_report(report: Report) -> None:
     for check in report.checks:
         suffix = f" - {check.detail}" if check.detail else ""
         print(f"- {check.status}: {check.label}{suffix}")
+    print()
+    if added:
+        print(
+            f"note: {added} new finding(s) recorded in {IGNORE_FILE_NAME} (unchecked). "
+            "Mark `[x]` there if you judge it a false positive to exclude it from future runs."
+        )
+    if removed:
+        print(f"note: {removed} resolved finding(s) removed from {IGNORE_FILE_NAME} (no longer detected).")
+    if suppressed:
+        print(f"suppressed as false positive ({IGNORE_FILE_NAME}): {len(suppressed)}")
+        for finding in suppressed:
+            print(f"- {finding.severity} {finding.kind} `{finding.location}`: {finding.message}")
 
 
 def install_global_hook() -> int:
@@ -892,7 +1009,10 @@ def main(argv: list[str]) -> int:
 
     repo = repo_root(args.repo.resolve())
     report = make_report(repo)
-    print_report(report)
+    checked_map, added, removed = sync_ignore_file(repo, report.findings)
+    suppressed = [f for f in report.findings if checked_map.get(finding_fingerprint(f))]
+    report.findings = [f for f in report.findings if not checked_map.get(finding_fingerprint(f))]
+    print_report(report, suppressed=suppressed, added=added, removed=removed)
     return 1 if any(f.severity == "Blocker" for f in report.findings) else 0
 
 
