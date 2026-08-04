@@ -90,7 +90,7 @@ Required:
 - Git
 - POSIX shell for the `pre-push-check` wrapper
 
-Optional tools are detected at runtime: `gitleaks`, `gh`, Node package managers, `ruff`, `pytest`, Go, Cargo, Java build tools, .NET, Make, CMake, Ruby, PHP, ShellCheck, and PowerShell.
+Optional tools are detected at runtime: `gitleaks`, `gh`, Node package managers, `ruff`, `pytest`, Go, Cargo, Java build tools, .NET, Make, CMake, Ruby, PHP, ShellCheck, and PowerShell. For `pytest`, a repository-local `.venv` or `venv` is used before the system command when available.
 
 The Python implementation uses only the standard library.
 

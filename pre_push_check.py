@@ -255,6 +255,23 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def venv_executable(repo: Path, name: str) -> Path | None:
+    candidates = []
+    for venv_name in (".venv", "venv"):
+        venv = repo / venv_name
+        candidates.extend(
+            (
+                venv / "bin" / name,
+                venv / "Scripts" / name,
+                venv / "Scripts" / f"{name}.exe",
+            )
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def git(repo: Path, args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
     return run(["git", *args], repo, check)
 
@@ -304,6 +321,14 @@ def read_text_if_exists(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def display_path(repo: Path, path: str) -> str:
+    candidate = Path(path)
+    try:
+        return candidate.relative_to(repo).as_posix()
+    except ValueError:
+        return candidate.as_posix()
 
 
 def make_target_exists(repo: Path, target: str) -> bool:
@@ -621,6 +646,21 @@ def node_runner(repo: Path) -> tuple[str, list[str]]:
     return "npm", ["npm", "run"]
 
 
+def resolve_pytest_command(repo: Path, command: list[str] | None = None) -> list[str] | None:
+    command = command or ["pytest"]
+    if command and command[0] == "pytest":
+        pytest = venv_executable(repo, "pytest")
+        if pytest:
+            return [str(pytest), *command[1:]]
+        return command if command_exists("pytest") else None
+    if len(command) >= 3 and command[1:3] == ["-m", "pytest"] and command[0] in {"python", "python3"}:
+        python = venv_executable(repo, "python")
+        if python:
+            return [str(python), *command[1:]]
+        return command if command_exists(command[0]) else None
+    return command
+
+
 def run_declared_node_checks(report: Report) -> None:
     repo = report.context.repo
     scripts = package_json_scripts(repo)
@@ -650,8 +690,10 @@ def run_python_checks(report: Report) -> None:
         add_command_check(report, "ruff check .", ["ruff", "check", "."], repo)
     else:
         add_skipped(report, "ruff", "ruff is not installed")
-    if command_exists("pytest"):
-        add_command_check(report, "pytest", ["pytest"], repo)
+    pytest_command = resolve_pytest_command(repo)
+    if pytest_command:
+        label = "pytest" if pytest_command[0] == "pytest" else display_path(repo, pytest_command[0])
+        add_command_check(report, label, pytest_command, repo)
     else:
         add_skipped(report, "pytest", "pytest is not installed")
 
@@ -749,15 +791,19 @@ def run_ci_declared_checks(report: Report, workflow_commands: list[list[str]]) -
     seen: set[tuple[str, ...]] = set()
     adopted = 0
     for command in workflow_commands:
-        key = tuple(command)
+        resolved_command = resolve_pytest_command(repo, command)
+        if not resolved_command:
+            add_skipped(report, f"CI declared: {' '.join(command)}", f"{command[0]} is not installed")
+            continue
+        key = tuple(resolved_command)
         if key in seen:
             continue
         seen.add(key)
-        if not command_exists(command[0]):
-            add_skipped(report, f"CI declared: {' '.join(command)}", f"{command[0]} is not installed")
+        if not Path(resolved_command[0]).exists() and not command_exists(resolved_command[0]):
+            add_skipped(report, f"CI declared: {' '.join(command)}", f"{resolved_command[0]} is not installed")
             continue
         adopted += 1
-        add_command_check(report, f"CI declared: {' '.join(command)}", command, repo)
+        add_command_check(report, f"CI declared: {' '.join(command)}", resolved_command, repo)
     report.checks.append(CheckRun("adopt CI declared commands", "ok", f"commands={adopted}"))
 
 
