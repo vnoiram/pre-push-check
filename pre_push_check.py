@@ -1068,6 +1068,7 @@ def main(argv: list[str]) -> int:
         return install_global_hook()
 
     repo = repo_root(args.repo.resolve())
+    print(f"pre-push-check: started checks for {repo}", file=sys.stderr, flush=True)
     report = make_report(repo)
     checked_map, added, removed = sync_ignore_file(repo, report.findings)
     suppressed = [f for f in report.findings if checked_map.get(finding_fingerprint(f))]
