@@ -5,14 +5,16 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, TypeVar
 
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -20,6 +22,9 @@ HOOK_MARKER = "# managed-by: pre-push-check"
 DEFAULT_HOOK = "pre-push"
 
 IGNORE_FILE_NAME = ".pre-push-check-ignore.md"
+LEGACY_CACHE_FILE_NAME = ".pre-push-check-cache.json"
+IGNORE_CACHE_START = "<!-- pre-push-check-cache"
+IGNORE_CACHE_END = "pre-push-check-cache -->"
 IGNORE_TABLE_HEADER = "| 済 | ID | 重大度 | 種別 | 検出箇所 | 説明 | 検出内容 |"
 IGNORE_TABLE_SEP = "|---|---|---|---|---|---|---|"
 IGNORE_ROW_PATTERN = re.compile(
@@ -97,6 +102,7 @@ GITIGNORE_PATTERNS = {
 DECLARED_COMMAND_TARGETS = ("lint", "typecheck", "check", "build", "test")
 SHELL_EXTENSIONS = {".sh", ".bash", ".zsh"}
 POWERSHELL_EXTENSIONS = {".ps1", ".psm1", ".psd1"}
+T = TypeVar("T")
 
 
 @dataclass
@@ -114,6 +120,7 @@ class CheckRun:
     label: str
     status: str
     detail: str = ""
+    duration_seconds: float | None = None
 
 
 @dataclass
@@ -134,6 +141,9 @@ class Report:
     findings: list[Finding] = field(default_factory=list)
     checks: list[CheckRun] = field(default_factory=list)
     executed_commands: set[tuple[str, ...]] = field(default_factory=set)
+    cache_key: str = ""
+    check_cache: dict[str, dict[str, object]] = field(default_factory=dict)
+    next_check_cache: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property
     def verdict(self) -> str:
@@ -176,13 +186,43 @@ def parse_ignore_table(path: Path) -> dict[str, tuple[bool, str, str, str, str, 
     return rows
 
 
-def render_ignore_table(rows: dict[str, tuple[bool, str, str, str, str, str]]) -> str:
+def render_ignore_cache(cache: dict[str, object] | None) -> list[str]:
+    if not cache:
+        return []
+    return [
+        IGNORE_CACHE_START,
+        json.dumps(cache, indent=2, sort_keys=True),
+        IGNORE_CACHE_END,
+        "",
+    ]
+
+
+def parse_ignore_cache(text: str) -> dict[str, object]:
+    start = text.find(IGNORE_CACHE_START)
+    if start == -1:
+        return {}
+    start += len(IGNORE_CACHE_START)
+    end = text.find(IGNORE_CACHE_END, start)
+    if end == -1:
+        return {}
+    try:
+        data = json.loads(text[start:end].strip())
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def render_ignore_table(
+    rows: dict[str, tuple[bool, str, str, str, str, str]],
+    cache: dict[str, object] | None = None,
+) -> str:
     lines = [
         "# pre-push-check 誤検知一覧",
         "",
         "このファイルは pre-push-check が自動生成・更新します。",
         "誤検知だと判断した行の `[ ]` を `[x]` に変更すると、以後その指摘は無視されます。",
-        "このファイルは `.gitignore` に自動追加されるため、リポジトリには含まれません（ローカル限定の判断です）。",
+        "このファイルは `.gitignore` に自動追加され、同じリポジトリの前回OKキャッシュも末尾に保存します。",
+        "どちらもリポジトリ単位のローカル情報なので、同時に複数のリポジトリで実行しても共有されません。",
         "",
         IGNORE_TABLE_HEADER,
         IGNORE_TABLE_SEP,
@@ -194,22 +234,27 @@ def render_ignore_table(rows: dict[str, tuple[bool, str, str, str, str, str]]) -
             f"{escape_table_cell(location)} | {escape_table_cell(message)} | {escape_table_cell(detail)} |"
         )
     lines.append("")
+    lines.extend(render_ignore_cache(cache))
     return "\n".join(lines)
 
 
 def ensure_gitignore_entry(repo: Path) -> None:
     gitignore = repo / ".gitignore"
     text = read_text_if_exists(gitignore)
-    if any(line.strip() == IGNORE_FILE_NAME for line in text.splitlines()):
+    existing = {line.strip() for line in text.splitlines()}
+    missing = [name for name in (IGNORE_FILE_NAME,) if name not in existing]
+    if not missing:
         return
     prefix = "" if not text or text.endswith("\n") else "\n"
     with gitignore.open("a", encoding="utf-8") as fh:
-        fh.write(f"{prefix}{IGNORE_FILE_NAME}\n")
+        fh.write(prefix + "\n".join(missing) + "\n")
 
 
 def sync_ignore_file(repo: Path, findings: list[Finding]) -> tuple[dict[str, bool], int, int]:
     path = ignore_file_path(repo)
+    existing_text = read_text_if_exists(path)
     existing_rows = parse_ignore_table(path)
+    cache = parse_ignore_cache(existing_text)
     suppressible = [f for f in findings if is_suppressible(f)]
     current_fingerprints = {finding_fingerprint(f) for f in suppressible}
     rows = {fp: row for fp, row in existing_rows.items() if fp in current_fingerprints}
@@ -228,12 +273,80 @@ def sync_ignore_file(repo: Path, findings: list[Finding]) -> tuple[dict[str, boo
             )
             added += 1
     if added or removed:
-        if rows:
-            path.write_text(render_ignore_table(rows), encoding="utf-8")
+        if rows or cache:
+            atomic_write_text(path, render_ignore_table(rows, cache))
         elif path.exists():
             path.unlink()
     ensure_gitignore_entry(repo)
     return {fingerprint: row[0] for fingerprint, row in rows.items()}, added, removed
+
+
+def legacy_cache_file_path(repo: Path) -> Path:
+    return repo / LEGACY_CACHE_FILE_NAME
+
+
+def load_cache(repo: Path, cache_key: str) -> dict[str, dict[str, object]]:
+    data = parse_ignore_cache(read_text_if_exists(ignore_file_path(repo)))
+    if not data:
+        try:
+            data = json.loads(legacy_cache_file_path(repo).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    if data.get("cache_key") != cache_key:
+        return {}
+    checks = data.get("checks", {})
+    return checks if isinstance(checks, dict) else {}
+
+
+def write_cache(repo: Path, cache_key: str, checks: dict[str, dict[str, object]]) -> None:
+    path = ignore_file_path(repo)
+    rows = parse_ignore_table(path)
+    cache = {
+        "version": 1,
+        "cache_key": cache_key,
+        "checks": checks,
+    }
+    atomic_write_text(path, render_ignore_table(rows, cache))
+    ensure_gitignore_entry(repo)
+
+
+def repo_state_cache_key(repo: Path) -> str:
+    parts = [
+        git_output(repo, ["rev-parse", "HEAD"]),
+        git_output(repo, ["rev-parse", "@{u}"]),
+        git_output(repo, ["status", "--porcelain=v1", "--untracked-files=all"]),
+        git_output(repo, ["diff", "HEAD", "--binary"]),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def cache_entry_key(kind: str, label: str, command: list[str] | None = None) -> str:
+    command_text = " ".join(command or [])
+    return hashlib.sha1(f"{kind}\x1f{label}\x1f{command_text}".encode("utf-8")).hexdigest()
+
+
+def cache_check_run(report: Report, key: str, check: CheckRun) -> None:
+    if check.status != "ok":
+        return
+    report.next_check_cache[key] = {
+        "label": check.label,
+        "detail": check.detail,
+        "duration_seconds": check.duration_seconds,
+    }
+
+
+def cached_check_run(report: Report, key: str, label: str) -> bool:
+    entry = report.check_cache.get(key)
+    if not entry:
+        return False
+    detail = str(entry.get("detail") or "previous ok result reused")
+    previous_duration = entry.get("duration_seconds")
+    if isinstance(previous_duration, (int, float)):
+        detail = f"{detail}; previous duration={format_duration(float(previous_duration))}"
+    report.checks.append(CheckRun(label, "cached-pass", detail))
+    report.next_check_cache[key] = entry
+    print_progress(f"cached-pass {label}")
+    return True
 
 
 def run(
@@ -249,6 +362,50 @@ def run(
         stderr=subprocess.STDOUT,
         check=check,
     )
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    return f"{int(minutes)}m{remainder:04.1f}s"
+
+
+def print_progress(message: str) -> None:
+    print(f"pre-push-check: {message}", file=sys.stderr, flush=True)
+
+
+def timed_call(label: str, action: Callable[[], T]) -> tuple[T, float]:
+    print_progress(f"start {label}")
+    started = time.perf_counter()
+    try:
+        result = action()
+    except Exception:
+        elapsed = time.perf_counter() - started
+        print_progress(f"failed {label} ({format_duration(elapsed)})")
+        raise
+    elapsed = time.perf_counter() - started
+    print_progress(f"done {label} ({format_duration(elapsed)})")
+    return result, elapsed
+
+
+def add_phase_check(report: Report, label: str, action: Callable[[], None]) -> None:
+    _, elapsed = timed_call(label, action)
+    report.checks.append(CheckRun(f"phase: {label}", "ok", duration_seconds=elapsed))
+
+
+def add_cacheable_clean_phase_check(report: Report, label: str, action: Callable[[], None]) -> None:
+    cache_key = cache_entry_key("phase", label)
+    if cached_check_run(report, cache_key, f"phase: {label}"):
+        return
+    finding_count = len(report.findings)
+    _, elapsed = timed_call(label, action)
+    check = CheckRun(f"phase: {label}", "ok", duration_seconds=elapsed)
+    report.checks.append(check)
+    if len(report.findings) == finding_count:
+        cache_check_run(report, cache_key, check)
 
 
 def command_exists(name: str) -> bool:
@@ -323,6 +480,42 @@ def read_text_if_exists(path: Path) -> str:
         return ""
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def acquire_repo_lock(repo: Path) -> Path:
+    lock = repo / f"{IGNORE_FILE_NAME}.lock"
+    started = time.monotonic()
+    while True:
+        try:
+            lock.mkdir()
+            return lock
+        except FileExistsError:
+            if time.monotonic() - started > 30:
+                raise SystemExit(f"timed out waiting for pre-push-check lock: {lock}")
+            time.sleep(0.1)
+
+
+def release_repo_lock(lock: Path) -> None:
+    try:
+        lock.rmdir()
+    except OSError:
+        pass
+
+
+def cleanup_legacy_cache(repo: Path) -> None:
+    try:
+        legacy_cache_file_path(repo).unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
 def display_path(repo: Path, path: str) -> str:
     candidate = Path(path)
     try:
@@ -375,14 +568,19 @@ def add_command_check(report: Report, label: str, command: list[str], cwd: Path,
         report.checks.append(CheckRun(label, "skipped", "same command already executed"))
         return
     report.executed_commands.add(key)
-    proc = run(command, cwd)
+    cache_key = cache_entry_key("command", label, command)
+    if cached_check_run(report, cache_key, label):
+        return
+    proc, elapsed = timed_call(f"command: {label}", lambda: run(command, cwd))
     detail = proc.stdout.strip()
     if proc.returncode == 0:
-        report.checks.append(CheckRun(label, "ok"))
+        check = CheckRun(label, "ok", duration_seconds=elapsed)
+        report.checks.append(check)
+        cache_check_run(report, cache_key, check)
         return
     if len(detail) > 1000:
         detail = f"{detail[:1000]}\n... truncated ..."
-    report.checks.append(CheckRun(label, "failed", detail))
+    report.checks.append(CheckRun(label, "failed", detail, elapsed))
     report.findings.append(
         Finding(
             "Blocker" if blocker else "Warning",
@@ -708,12 +906,20 @@ def run_go_checks(report: Report) -> None:
     if command_exists("gofmt"):
         go_files = [p.relative_to(repo).as_posix() for p in repo.rglob("*.go") if ".git" not in p.parts and "vendor" not in p.parts]
         if go_files:
-            proc = run(["gofmt", "-l", *go_files], repo)
-            status = "ok" if proc.returncode == 0 and not proc.stdout.strip() else "failed"
-            report.checks.append(CheckRun("gofmt -l", status, proc.stdout.strip()))
-            if status == "failed":
-                unformatted = ", ".join(proc.stdout.split()) or "."
-                report.findings.append(Finding("Blocker", "format", unformatted, "Go files are not gofmt-formatted.", "Run gofmt before pushing."))
+            command = ["gofmt", "-l", *go_files]
+            cache_key = cache_entry_key("command", "gofmt -l", command)
+            if cached_check_run(report, cache_key, "gofmt -l"):
+                proc = None
+            else:
+                proc, elapsed = timed_call("command: gofmt -l", lambda: run(command, repo))
+            if proc is not None:
+                status = "ok" if proc.returncode == 0 and not proc.stdout.strip() else "failed"
+                check = CheckRun("gofmt -l", status, proc.stdout.strip(), elapsed)
+                report.checks.append(check)
+                cache_check_run(report, cache_key, check)
+                if status == "failed":
+                    unformatted = ", ".join(proc.stdout.split()) or "."
+                    report.findings.append(Finding("Blocker", "format", unformatted, "Go files are not gofmt-formatted.", "Run gofmt before pushing."))
     add_command_check(report, "go vet ./...", ["go", "vet", "./..."], repo)
     add_command_check(report, "go test ./...", ["go", "test", "./..."], repo)
 
@@ -833,10 +1039,13 @@ def scan_ci(report: Report) -> None:
     report.checks.append(CheckRun("inspect GitHub Actions", "ok"))
     run_ci_declared_checks(report, workflow_commands)
     if command_exists("gh"):
-        proc = run(["gh", "run", "list", "--limit", "5"], report.context.repo)
+        proc, elapsed = timed_call(
+            "command: gh run list --limit 5",
+            lambda: run(["gh", "run", "list", "--limit", "5"], report.context.repo),
+        )
         status = "ok" if proc.returncode == 0 else "skipped"
         detail = "recent runs available" if proc.returncode == 0 else "gh is installed but recent runs could not be queried"
-        report.checks.append(CheckRun("inspect recent GitHub Actions runs", status, detail))
+        report.checks.append(CheckRun("inspect recent GitHub Actions runs", status, detail, elapsed))
     else:
         add_skipped(report, "inspect recent GitHub Actions runs", "gh is not installed")
 
@@ -972,18 +1181,23 @@ def run_stack_checks(report: Report) -> None:
 
 
 def make_report(repo: Path) -> Report:
-    report = Report(build_context(repo))
-    scan_git_metadata(report)
-    scan_remote_publicity(report)
-    scan_history(report)
-    scan_history_quality(report)
-    scan_history_file_shapes(report)
-    scan_worktree(report)
-    scan_local_paths(report)
-    scan_tracked_paths(report)
-    scan_gitignore_coverage(report)
-    scan_ci(report)
-    run_stack_checks(report)
+    context, elapsed = timed_call("build repository context", lambda: build_context(repo))
+    cache_key, cache_elapsed = timed_call("compute cache fingerprint", lambda: repo_state_cache_key(repo))
+    check_cache = load_cache(repo, cache_key)
+    report = Report(context, cache_key=cache_key, check_cache=check_cache)
+    report.checks.append(CheckRun("phase: build repository context", "ok", duration_seconds=elapsed))
+    report.checks.append(CheckRun("phase: compute cache fingerprint", "ok", duration_seconds=cache_elapsed))
+    add_phase_check(report, "inspect git metadata", lambda: scan_git_metadata(report))
+    add_phase_check(report, "inspect remotes", lambda: scan_remote_publicity(report))
+    add_phase_check(report, "scan push history for secrets", lambda: scan_history(report))
+    add_cacheable_clean_phase_check(report, "inspect history quality", lambda: scan_history_quality(report))
+    add_cacheable_clean_phase_check(report, "inspect pushed file paths", lambda: scan_history_file_shapes(report))
+    add_cacheable_clean_phase_check(report, "scan tracked file contents", lambda: scan_worktree(report))
+    add_cacheable_clean_phase_check(report, "scan tracked files for local paths", lambda: scan_local_paths(report))
+    add_cacheable_clean_phase_check(report, "scan tracked path metadata", lambda: scan_tracked_paths(report))
+    add_cacheable_clean_phase_check(report, "inspect .gitignore coverage", lambda: scan_gitignore_coverage(report))
+    add_phase_check(report, "inspect CI configuration", lambda: scan_ci(report))
+    add_phase_check(report, "run stack-specific checks", lambda: run_stack_checks(report))
     return report
 
 
@@ -1018,8 +1232,9 @@ def print_report(
     print()
     print("Checks:")
     for check in report.checks:
+        duration = f" [{format_duration(check.duration_seconds)}]" if check.duration_seconds is not None else ""
         suffix = f" - {check.detail}" if check.detail else ""
-        print(f"- {check.status}: {check.label}{suffix}")
+        print(f"- {check.status}{duration}: {check.label}{suffix}")
     print()
     if added:
         print(
@@ -1063,17 +1278,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    started = time.perf_counter()
     args = parse_args(argv)
     if args.install_global_hook:
         return install_global_hook()
 
     repo = repo_root(args.repo.resolve())
-    print(f"pre-push-check: started checks for {repo}", file=sys.stderr, flush=True)
+    print_progress(f"started checks for {repo}")
     report = make_report(repo)
-    checked_map, added, removed = sync_ignore_file(repo, report.findings)
+    lock = acquire_repo_lock(repo)
+    try:
+        (checked_map, added, removed), elapsed = timed_call(
+            f"sync {IGNORE_FILE_NAME}",
+            lambda: sync_ignore_file(repo, report.findings),
+        )
+        report.checks.append(CheckRun(f"phase: sync {IGNORE_FILE_NAME}", "ok", duration_seconds=elapsed))
+        cleanup_legacy_cache(repo)
+    finally:
+        release_repo_lock(lock)
     suppressed = [f for f in report.findings if checked_map.get(finding_fingerprint(f))]
     report.findings = [f for f in report.findings if not checked_map.get(finding_fingerprint(f))]
-    print_report(report, suppressed=suppressed, added=added, removed=removed)
+    lock = acquire_repo_lock(repo)
+    try:
+        print_report(report, suppressed=suppressed, added=added, removed=removed)
+        write_cache(repo, report.cache_key, report.next_check_cache)
+    finally:
+        release_repo_lock(lock)
+    print_progress(f"finished checks ({format_duration(time.perf_counter() - started)})")
     return 1 if any(f.severity == "Blocker" for f in report.findings) else 0
 
 

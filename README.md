@@ -38,18 +38,41 @@ Stack-specific checks are run only when the repository declares the matching sta
 
 Skipped checks are listed with the reason. Missing tools are not installed automatically.
 
+## Timing Output
+
+While checks are running, progress is written to stderr so long repositories do not appear stuck:
+
+```text
+pre-push-check: start scan tracked file contents
+pre-push-check: done scan tracked file contents (1.7s)
+pre-push-check: start command: pytest
+pre-push-check: done command: pytest (42.3s)
+```
+
+The final `Checks:` section also includes elapsed time for measured phases and external commands,
+making it easier to identify whether file scans, history inspection, CI adoption, or stack-specific
+commands are responsible for slow runs.
+
+If the repository state is unchanged since the previous run, checks that passed cleanly are reused
+from a local cache block in `.pre-push-check-ignore.md` and shown as `cached-pass`. The cache key
+includes `HEAD`, the upstream revision, working tree status, and the full `git diff HEAD --binary`,
+so editing code or changing the push range invalidates the cache. Failed commands and scans that
+produced findings are not treated as clean passes. The file is written under a repo-local lock, so
+running checks in multiple repositories at the same time does not share or corrupt cache state.
+
 ## Suppressing False Positives
 
 Every run writes `.pre-push-check-ignore.md` at the target repository root and adds it to that
 repository's `.gitignore` automatically. This is the one exception to the report-only default:
-the tool always maintains this file so persistent false positives don't block `git push` forever.
+the tool always maintains this file so persistent false positives and previous clean-pass cache
+state don't block `git push` forever.
 
 Each finding is fingerprinted from its `kind` + `location` (`file:line`) + `message` + the actual
 matched content (e.g. the literal source line a secret/debug/local-path regex matched). The table
 records that matched content too, so a row reads like:
 
 ```
-| [ ] | f8d29dc8cdf8 | Blocker | secret | foobar.yaml:1 | Possible secret in tracked file. | api_key = "SECRET-KEY-HERE" |
+| [ ] | f8d29dc8cdf8 | Blocker | secret | foobar.yaml:1 | Possible secret in tracked file. | redacted sample credential |
 ```
 
 New findings are appended as an unchecked row (`[ ]`). Edit the file and change the box to `[x]`
