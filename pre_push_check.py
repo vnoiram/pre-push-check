@@ -212,29 +212,45 @@ def parse_ignore_cache(text: str) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
-def render_ignore_table(
-    rows: dict[str, tuple[bool, str, str, str, str, str]],
-    cache: dict[str, object] | None = None,
-) -> str:
-    lines = [
-        "# pre-push-check 誤検知一覧",
-        "",
-        "このファイルは pre-push-check が自動生成・更新します。",
-        "誤検知だと判断した行の `[ ]` を `[x]` に変更すると、以後その指摘は無視されます。",
-        "このファイルは `.gitignore` に自動追加され、同じリポジトリの前回OKキャッシュも末尾に保存します。",
-        "どちらもリポジトリ単位のローカル情報なので、同時に複数のリポジトリで実行しても共有されません。",
-        "",
-        IGNORE_TABLE_HEADER,
-        IGNORE_TABLE_SEP,
-    ]
+def render_ignore_rows(rows: dict[str, tuple[bool, str, str, str, str, str]]) -> list[str]:
+    lines = [IGNORE_TABLE_HEADER, IGNORE_TABLE_SEP]
     for fingerprint, (checked, severity, kind, location, message, detail) in rows.items():
         box = "[x]" if checked else "[ ]"
         lines.append(
             f"| {box} | {fingerprint} | {escape_table_cell(severity)} | {escape_table_cell(kind)} | "
             f"{escape_table_cell(location)} | {escape_table_cell(message)} | {escape_table_cell(detail)} |"
         )
+    return lines
+
+
+def render_ignore_table(
+    rows: dict[str, tuple[bool, str, str, str, str, str]],
+    cache: dict[str, object] | None = None,
+) -> str:
+    pending = {fp: row for fp, row in rows.items() if not row[0]}
+    ignored = {fp: row for fp, row in rows.items() if row[0]}
+    lines = [
+        "# pre-push-check 誤検知一覧",
+        "",
+        "このファイルは pre-push-check が自動生成・更新します。",
+        "誤検知だと判断した行の `[ ]` を `[x]` に変更すると、次回実行時に「誤検知として無視中」に移動し、"
+        "以後その指摘は無視されます。",
+        "このファイルは `.gitignore` に自動追加され、同じリポジトリの前回OKキャッシュも末尾に保存します。",
+        "どちらもリポジトリ単位のローカル情報なので、同時に複数のリポジトリで実行しても共有されません。",
+        "",
+        "## 未確認の指摘",
+        "",
+    ]
+    lines.extend(render_ignore_rows(pending) if pending else ["(なし)"])
     lines.append("")
-    lines.extend(render_ignore_cache(cache))
+    lines.append("## 誤検知として無視中（チェック済み）")
+    lines.append("")
+    lines.extend(render_ignore_rows(ignored) if ignored else ["(なし)"])
+    lines.append("")
+    if cache:
+        lines.append("## 内部キャッシュ（前回OKキャッシュ、手動編集不要）")
+        lines.append("")
+        lines.extend(render_ignore_cache(cache))
     return "\n".join(lines)
 
 

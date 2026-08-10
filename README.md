@@ -75,9 +75,12 @@ records that matched content too, so a row reads like:
 | [ ] | f8d29dc8cdf8 | Blocker | secret | foobar.yaml:1 | Possible secret in tracked file. | redacted sample credential |
 ```
 
-New findings are appended as an unchecked row (`[ ]`). Edit the file and change the box to `[x]`
-to mark a row as a false positive; on the next run that exact finding is excluded from the report
-and no longer counts toward the Blocker verdict.
+The file has three sections: an unchecked "pending" table for findings still awaiting a decision, a
+checked "ignored as false positive" table for rows you have already dismissed, and an internal cache
+block for previous clean-pass results. New findings are appended as an unchecked row (`[ ]`) under
+the pending table. Edit the file and change the box to `[x]` to mark a row as a false positive; on
+the next run that row moves down into the ignored table, that exact finding is excluded from the
+report, and it no longer counts toward the Blocker verdict.
 
 Because the fingerprint includes the line number and the matched content, moving code so the line
 shifts, or editing that same line to a different value, produces a new fingerprint and the finding
