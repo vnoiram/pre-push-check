@@ -11,6 +11,7 @@ Always-on checks:
 - Push range, branch, upstream, remotes, and working tree status
 - Secret-like values in tracked files
 - Secret-like changes in the commits being pushed, using `gitleaks` when available and a Git fallback otherwise
+  (`gitleaks` findings are rerun with `-v`, expanded into suppressible findings, and listed in `.pre-push-check-ignore.md`)
 - Commit author emails, WIP/fixup/squash subjects, and merge commits in the push range
 - Conflict markers
 - Clear debug remnants such as `console.log`, `debugger`, `fmt.Println`, `Write-Host`, `dbg!`, and `var_dump`
@@ -104,6 +105,10 @@ files are the reason" — and are never written to the table, always reported at
 regardless of any past checkbox: `upstream`, `remote`, and `command`. `command` in particular only
 carries `` `<label>` failed with exit code N ``, not which assertion or file actually failed, so a
 checked-off row would silently swallow a different, unrelated future failure of the same command.
+`gitleaks` detections are an exception to that command shape: when `gitleaks` reports leaks,
+pre-push-check converts each leak into a `secret-history` finding with file, line, rule, and
+fingerprint information, so intentional fixtures such as test JWTs can be checked off just like
+other false positives.
 
 The file is local-only (gitignored) — it records this machine's judgment calls, not a
 team-wide policy.

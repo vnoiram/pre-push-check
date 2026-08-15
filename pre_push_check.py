@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -170,7 +171,7 @@ def ignore_file_path(repo: Path) -> Path:
 
 
 def escape_table_cell(text: str) -> str:
-    return text.replace("|", "\\|")
+    return text.replace("\r", "").replace("\n", "\\n").replace("|", "\\|")
 
 
 def parse_ignore_table(path: Path) -> dict[str, tuple[bool, str, str, str, str, str]]:
@@ -608,6 +609,106 @@ def add_command_check(report: Report, label: str, command: list[str], cwd: Path,
     )
 
 
+def truncated(text: str, limit: int = 1000) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n... truncated ..."
+
+
+def load_gitleaks_findings(report_path: Path) -> list[dict[str, object]]:
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def gitleaks_finding(leak: dict[str, object]) -> Finding:
+    file_name = str(leak.get("File") or "git history")
+    start_line = leak.get("StartLine")
+    location = file_name
+    if isinstance(start_line, int) and start_line > 0:
+        location = f"{file_name}:{start_line}"
+    commit = str(leak.get("Commit") or "")
+    if commit:
+        location = f"{location}@{commit[:12]}"
+
+    rule = str(leak.get("RuleID") or leak.get("Description") or "gitleaks")
+    match = str(leak.get("Match") or leak.get("Secret") or leak.get("Fingerprint") or "")
+    fingerprint = str(leak.get("Fingerprint") or "")
+    detail_parts = [part for part in (f"rule={rule}", match, fingerprint) if part]
+    detail = "; ".join(detail_parts)
+    return Finding(
+        "Blocker",
+        "secret-history",
+        location,
+        "gitleaks detected a possible secret.",
+        "If this is an intentional test fixture, mark it `[x]` in .pre-push-check-ignore.md; otherwise remove it and rotate the credential if real.",
+        detail,
+    )
+
+
+def add_gitleaks_check(report: Report) -> None:
+    label = "gitleaks detect"
+    command = ["gitleaks", "detect", "--source", str(report.context.repo)]
+    cache_key = cache_entry_key("command", label, command)
+    if tuple(command) in report.executed_commands:
+        report.checks.append(CheckRun(label, "skipped", "same command already executed"))
+        return
+    report.executed_commands.add(tuple(command))
+    if cached_check_run(report, cache_key, label):
+        return
+
+    with tempfile.TemporaryDirectory(prefix="pre-push-check-gitleaks-") as temp_dir:
+        report_path = Path(temp_dir) / "gitleaks.json"
+        report_command = [
+            *command,
+            "--report-format",
+            "json",
+            "--report-path",
+            str(report_path),
+        ]
+        proc, elapsed = timed_call(f"command: {label}", lambda: run(report_command, report.context.repo))
+        if proc.returncode == 0:
+            check = CheckRun(label, "ok", duration_seconds=elapsed)
+            report.checks.append(check)
+            cache_check_run(report, cache_key, check)
+            return
+
+        verbose_command = [
+            "gitleaks",
+            "detect",
+            "-v",
+            "--no-color",
+            "--source",
+            str(report.context.repo),
+            "--report-format",
+            "json",
+            "--report-path",
+            str(report_path),
+        ]
+        verbose_proc, verbose_elapsed = timed_call(
+            "command: gitleaks detect -v",
+            lambda: run(verbose_command, report.context.repo),
+        )
+        detail = truncated(verbose_proc.stdout.strip() or proc.stdout.strip())
+        report.checks.append(CheckRun("gitleaks detect -v", "failed", detail, elapsed + verbose_elapsed))
+        leaks = load_gitleaks_findings(report_path)
+        for leak in leaks:
+            report.findings.append(gitleaks_finding(leak))
+        if leaks:
+            return
+        report.findings.append(
+            Finding(
+                "Blocker",
+                "command",
+                ".",
+                f"`{label}` failed with exit code {proc.returncode}",
+                "Inspect the verbose gitleaks output, remove any real secret, and rotate the credential if real.",
+            )
+        )
+
+
 def add_skipped(report: Report, label: str, reason: str) -> None:
     report.checks.append(CheckRun(label, "skipped", reason))
 
@@ -661,7 +762,7 @@ def scan_worktree(report: Report) -> None:
 
 def scan_history(report: Report) -> None:
     if command_exists("gitleaks"):
-        add_command_check(report, "gitleaks detect", ["gitleaks", "detect", "--source", str(report.context.repo)], report.context.repo)
+        add_gitleaks_check(report)
         return
 
     pattern = SECRET_PATTERN.pattern
@@ -1240,8 +1341,8 @@ def print_report(
         print("|---|---|---|---|---|---|")
         for finding in report.findings:
             print(
-                f"| {finding.severity} | {finding.kind} | `{finding.location}` | "
-                f"{finding.message} | {finding.detail} | {finding.recommendation} |"
+                f"| {escape_table_cell(finding.severity)} | {escape_table_cell(finding.kind)} | `{escape_table_cell(finding.location)}` | "
+                f"{escape_table_cell(finding.message)} | {escape_table_cell(finding.detail)} | {escape_table_cell(finding.recommendation)} |"
             )
     else:
         print("No findings.")
