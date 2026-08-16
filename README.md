@@ -110,6 +110,14 @@ pre-push-check converts each leak into a `secret-history` finding with file, lin
 fingerprint information, so intentional fixtures such as test JWTs can be checked off just like
 other false positives.
 
+Future checks should follow the same split. If a check detects content that may intentionally stay
+in the repository, such as test credentials, fixture-like debug lines, local-path examples, or
+versioned generated files, emit a concrete `Finding` with stable location and matched content so it
+can be reviewed and suppressed. If a check is an ordinary quality gate whose failure should disappear
+after fixing code, such as formatting, lint, syntax, build, or test failures, keep it as a command
+check and put the useful details in the `Checks:` output instead of creating persistent findings.
+`ruff` is the model for that command-check behavior.
+
 The file is local-only (gitignored) — it records this machine's judgment calls, not a
 team-wide policy.
 
