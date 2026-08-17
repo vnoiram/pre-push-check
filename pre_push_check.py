@@ -229,6 +229,8 @@ def render_ignore_table(
     cache: dict[str, object] | None = None,
 ) -> str:
     pending = {fp: row for fp, row in rows.items() if not row[0]}
+    pending_blockers = {fp: row for fp, row in pending.items() if row[1] == "Blocker"}
+    pending_other = {fp: row for fp, row in pending.items() if row[1] != "Blocker"}
     ignored = {fp: row for fp, row in rows.items() if row[0]}
     lines = [
         "# pre-push-check 誤検知一覧",
@@ -242,7 +244,13 @@ def render_ignore_table(
         "## 未確認の指摘",
         "",
     ]
-    lines.extend(render_ignore_rows(pending) if pending else ["(なし)"])
+    lines.append("### blocker")
+    lines.append("")
+    lines.extend(render_ignore_rows(pending_blockers) if pending_blockers else ["(なし)"])
+    lines.append("")
+    lines.append("### other")
+    lines.append("")
+    lines.extend(render_ignore_rows(pending_other) if pending_other else ["(なし)"])
     lines.append("")
     lines.append("## 誤検知として無視中（チェック済み）")
     lines.append("")
