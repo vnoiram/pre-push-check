@@ -50,3 +50,15 @@ def test_display_groups_lines_per_file_and_keeps_all_files():
     assert text == "[x3] a.rb:1,9; b.rb:3"
     many = ppc.format_locations([f"a.rb:{i}" for i in range(1, 16)] + ["z.rb:1"])
     assert "a.rb:1,2,3,4,5,6,7,8,9,10,...(+5)" in many and "z.rb:1" in many
+
+
+def test_mark_match_highlights_assignment():
+    out = ppc.mark_match(LINE, ppc.SECRET_PATTERN, extend=True)
+    assert out == "test_it(**csrf_token = param.token** || param.csrf_token, foobar)"
+
+
+def test_marked_does_not_change_fingerprint():
+    a = secret("a.rb:1")
+    b = secret("a.rb:1")
+    b.marked = ppc.mark_match(LINE, ppc.SECRET_PATTERN, extend=True)
+    assert ppc.finding_fingerprint(a) == ppc.finding_fingerprint(b)

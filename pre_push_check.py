@@ -117,6 +117,8 @@ class Finding:
     # Every place this finding occurs once identical findings are merged (see merge_findings).
     # Empty means "just `location`".
     locations: list[str] = field(default_factory=list)
+    # `detail` with the matched span wrapped in `**` for display only; never part of the fingerprint.
+    marked: str = ""
 
 
 @dataclass
@@ -175,6 +177,21 @@ def finding_fingerprint(finding: Finding) -> str:
         f"{finding.kind}\x1f{anchor}\x1f{finding.message}\x1f{finding.detail}".encode("utf-8")
     ).hexdigest()
     return digest[:12]
+
+
+def mark_match(text: str, pattern: re.Pattern[str], extend: bool = False) -> str:
+    """Wrap the first `pattern` match in Markdown bold. `extend` widens it to the whole
+    identifier on the left and the assigned value on the right (for `key = value` hits)."""
+    match = pattern.search(text)
+    if not match:
+        return text
+    start, end = match.span()
+    if extend:
+        while start > 0 and re.match(r"[\w.-]", text[start - 1]):
+            start -= 1
+        tail = re.match(r"\s*[^\s,;)]*", text[end:])
+        end += tail.end() if tail else 0
+    return f"{text[:start]}**{text[start:end]}**{text[end:]}"
 
 
 def merge_findings(findings: list[Finding]) -> list[Finding]:
@@ -357,7 +374,7 @@ def sync_ignore_file(repo: Path, findings: list[Finding]) -> tuple[dict[str, boo
                 finding.kind,
                 finding.location,
                 finding.message,
-                finding.detail,
+                finding.marked or finding.detail,
             )
             added += 1
     if added or removed or refreshed:
@@ -816,7 +833,7 @@ def scan_worktree(report: Report) -> None:
             if SECRET_PATTERN.search(line):
                 secret_hits += 1
                 report.findings.append(
-                    Finding("Blocker", "secret", location, "Possible secret in tracked file.", "Remove it and rotate the credential if real.", line.strip())
+                    Finding("Blocker", "secret", location, "Possible secret in tracked file.", "Remove it and rotate the credential if real.", line.strip(), marked=mark_match(line.strip(), SECRET_PATTERN, extend=True))
                 )
             if CONFLICT_PATTERN.search(line):
                 conflict_hits += 1
@@ -826,7 +843,7 @@ def scan_worktree(report: Report) -> None:
             if path.suffix in DEBUG_EXTENSIONS and "pre-push-check: ignore-debug" not in line and DEBUG_PATTERN.search(line):
                 debug_hits += 1
                 report.findings.append(
-                    Finding("Warning", "debug", location, "Possible debug remnant.", "Confirm it is intentional or remove it.", line.strip())
+                    Finding("Warning", "debug", location, "Possible debug remnant.", "Confirm it is intentional or remove it.", line.strip(), marked=mark_match(line.strip(), DEBUG_PATTERN))
                 )
     report.checks.append(CheckRun("scan tracked files for secrets", "ok", f"hits={secret_hits}"))
     report.checks.append(CheckRun("scan tracked files for conflict markers", "ok", f"hits={conflict_hits}"))
@@ -992,7 +1009,7 @@ def scan_local_paths(report: Report) -> None:
             if LOCAL_PATH_PATTERN.search(line):
                 hits += 1
                 report.findings.append(
-                    Finding("Warning", "local-path", f"{rel}:{lineno}", "Local absolute path appears in a tracked file.", "Replace it with a relative path or configuration.", line.strip())
+                    Finding("Warning", "local-path", f"{rel}:{lineno}", "Local absolute path appears in a tracked file.", "Replace it with a relative path or configuration.", line.strip(), marked=mark_match(line.strip(), LOCAL_PATH_PATTERN))
                 )
     report.checks.append(CheckRun("scan tracked files for local paths", "ok", f"hits={hits}"))
 
@@ -1415,7 +1432,7 @@ def print_report(
         for finding in report.findings:
             print(
                 f"| {escape_table_cell(finding.severity)} | {escape_table_cell(finding.kind)} | `{escape_table_cell(finding.location)}` | "
-                f"{escape_table_cell(finding.message)} | {escape_table_cell(finding.detail)} | {escape_table_cell(finding.recommendation)} |"
+                f"{escape_table_cell(finding.message)} | {escape_table_cell(finding.marked or finding.detail)} | {escape_table_cell(finding.recommendation)} |"
             )
     else:
         print("No findings.")

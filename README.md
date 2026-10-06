@@ -94,6 +94,10 @@ Findings with the same fingerprint are merged into a single row/report entry who
 every occurrence (`[x3] a.rb:1,9; b.rb:3`, grouped per file; every file name is always shown, only line numbers beyond 10 per file are elided). Checking that one row
 suppresses all identical occurrences, including ones added later in other files.
 
+The matched part of the line is wrapped in Markdown bold (`**...**`) in both the report and the
+ignore file, e.g. `test_it(**csrf_token = param.token** || ...)`. This is display-only and does not
+affect the fingerprint.
+
 Rows for findings that no longer occur (fixed in code, so the same fingerprint is not produced by
 the current run) are removed automatically on the next run, keeping the table limited to findings
 that are still present. If every row is removed, the file itself is deleted.
