@@ -159,7 +159,7 @@ class Report:
 
 
 LOCATION_POSITION_SUFFIX = re.compile(r":\d+(?:@[0-9a-f]+)?$|@[0-9a-f]+$")
-MAX_DISPLAYED_LOCATIONS = 10
+MAX_DISPLAYED_LINES = 10
 
 
 def finding_fingerprint(finding: Finding) -> str:
@@ -197,11 +197,26 @@ def merge_findings(findings: list[Finding]) -> list[Finding]:
 
 
 def format_locations(locations: list[str]) -> str:
-    shown = ", ".join(locations[:MAX_DISPLAYED_LOCATIONS])
-    extra = len(locations) - MAX_DISPLAYED_LOCATIONS
-    if extra > 0:
-        shown += f", ... (+{extra} more)"
-    return f"[x{len(locations)}] {shown}" if len(locations) > 1 else shown
+    """Group occurrences by file so every file name stays visible: `a.rb:1,9; b.rb:3`."""
+    by_file: dict[str, list[str]] = {}
+    for place in locations:
+        match = LOCATION_POSITION_SUFFIX.search(place)
+        if match and match.group(0).startswith(":"):
+            file_name, position = place[: match.start()], place[match.start() + 1 :]
+        else:
+            file_name, position = place, ""
+        by_file.setdefault(file_name, [])
+        if position:
+            by_file[file_name].append(position)
+    parts = []
+    for file_name, positions in by_file.items():
+        shown = positions[:MAX_DISPLAYED_LINES]
+        text = f"{file_name}:{','.join(shown)}" if shown else file_name
+        if len(positions) > len(shown):
+            text += f",...(+{len(positions) - len(shown)})"
+        parts.append(text)
+    joined = "; ".join(parts)
+    return f"[x{len(locations)}] {joined}" if len(locations) > 1 else joined
 
 
 def is_suppressible(finding: Finding) -> bool:

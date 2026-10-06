@@ -91,7 +91,7 @@ the line shifts does not make a checked-off finding reappear. Editing the matche
 different value still produces a new fingerprint and the finding comes back unchecked.
 
 Findings with the same fingerprint are merged into a single row/report entry whose location lists
-every occurrence (`[x3] a.rb:1, a.rb:9, b.rb:3`, truncated after 10). Checking that one row
+every occurrence (`[x3] a.rb:1,9; b.rb:3`, grouped per file; every file name is always shown, only line numbers beyond 10 per file are elided). Checking that one row
 suppresses all identical occurrences, including ones added later in other files.
 
 Rows for findings that no longer occur (fixed in code, so the same fingerprint is not produced by

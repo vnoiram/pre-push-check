@@ -42,4 +42,11 @@ def test_sync_survives_line_shift_and_checked_stays():
         path.write_text(path.read_text().replace("[ ]", "[x]"))
         checked, added, _ = ppc.sync_ignore_file(repo, ppc.merge_findings([secret("a.rb:7"), secret("c.rb:2")]))
         assert added == 0 and list(checked.values()) == [True]
-        assert "a.rb:7, c.rb:2" in path.read_text()
+        assert "a.rb:7; c.rb:2" in path.read_text()
+
+
+def test_display_groups_lines_per_file_and_keeps_all_files():
+    text = ppc.format_locations(["a.rb:1", "a.rb:9", "b.rb:3"])
+    assert text == "[x3] a.rb:1,9; b.rb:3"
+    many = ppc.format_locations([f"a.rb:{i}" for i in range(1, 16)] + ["z.rb:1"])
+    assert "a.rb:1,2,3,4,5,6,7,8,9,10,...(+5)" in many and "z.rb:1" in many
