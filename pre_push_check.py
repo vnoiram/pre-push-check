@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 
@@ -114,6 +114,9 @@ class Finding:
     message: str
     recommendation: str
     detail: str = ""
+    # Every place this finding occurs once identical findings are merged (see merge_findings).
+    # Empty means "just `location`".
+    locations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -155,11 +158,50 @@ class Report:
         return "PUSH 可"
 
 
+LOCATION_POSITION_SUFFIX = re.compile(r":\d+(?:@[0-9a-f]+)?$|@[0-9a-f]+$")
+MAX_DISPLAYED_LOCATIONS = 10
+
+
 def finding_fingerprint(finding: Finding) -> str:
+    """Identify a finding by what was matched, not by where it sits.
+
+    With matched content (`detail`), the location is left out entirely so the same content is one
+    finding wherever it appears, and moving it to another line/file keeps its identity. Without
+    content, the location is the only anchor, but its line number / commit suffix is dropped so a
+    line shift does not make the finding look new.
+    """
+    anchor = "" if finding.detail else LOCATION_POSITION_SUFFIX.sub("", finding.location)
     digest = hashlib.sha1(
-        f"{finding.kind}\x1f{finding.location}\x1f{finding.message}\x1f{finding.detail}".encode("utf-8")
+        f"{finding.kind}\x1f{anchor}\x1f{finding.message}\x1f{finding.detail}".encode("utf-8")
     ).hexdigest()
     return digest[:12]
+
+
+def merge_findings(findings: list[Finding]) -> list[Finding]:
+    """Collapse findings with the same fingerprint into one, keeping every location."""
+    merged: dict[str, Finding] = {}
+    for finding in findings:
+        key = finding_fingerprint(finding)
+        places = finding.locations or [finding.location]
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = replace(finding, locations=list(dict.fromkeys(places)))
+            continue
+        for place in places:
+            if place not in existing.locations:
+                existing.locations.append(place)
+    result = list(merged.values())
+    for finding in result:
+        finding.location = format_locations(finding.locations)
+    return result
+
+
+def format_locations(locations: list[str]) -> str:
+    shown = ", ".join(locations[:MAX_DISPLAYED_LOCATIONS])
+    extra = len(locations) - MAX_DISPLAYED_LOCATIONS
+    if extra > 0:
+        shown += f", ... (+{extra} more)"
+    return f"[x{len(locations)}] {shown}" if len(locations) > 1 else shown
 
 
 def is_suppressible(finding: Finding) -> bool:
@@ -285,9 +327,15 @@ def sync_ignore_file(repo: Path, findings: list[Finding]) -> tuple[dict[str, boo
     rows = {fp: row for fp, row in existing_rows.items() if fp in current_fingerprints}
     removed = len(existing_rows) - len(rows)
     added = 0
+    refreshed = 0
     for finding in suppressible:
         fingerprint = finding_fingerprint(finding)
-        if fingerprint not in rows:
+        if fingerprint in rows:
+            old = rows[fingerprint]
+            if old[3] != finding.location:
+                rows[fingerprint] = (*old[:3], finding.location, *old[4:])
+                refreshed += 1
+        else:
             rows[fingerprint] = (
                 False,
                 finding.severity,
@@ -297,7 +345,7 @@ def sync_ignore_file(repo: Path, findings: list[Finding]) -> tuple[dict[str, boo
                 finding.detail,
             )
             added += 1
-    if added or removed:
+    if added or removed or refreshed:
         if rows or cache:
             atomic_write_text(path, render_ignore_table(rows, cache))
         elif path.exists():
@@ -644,7 +692,9 @@ def gitleaks_finding(leak: dict[str, object]) -> Finding:
     rule = str(leak.get("RuleID") or leak.get("Description") or "gitleaks")
     match = str(leak.get("Match") or leak.get("Secret") or leak.get("Fingerprint") or "")
     fingerprint = str(leak.get("Fingerprint") or "")
-    detail_parts = [part for part in (f"rule={rule}", match, fingerprint) if part]
+    # gitleaks' own fingerprint embeds file:line:commit, which would make the finding look new
+    # whenever it moves; only fall back to it when there is no matched content.
+    detail_parts = [part for part in (f"rule={rule}", match or fingerprint) if part]
     detail = "; ".join(detail_parts)
     return Finding(
         "Blocker",
@@ -1411,6 +1461,7 @@ def main(argv: list[str]) -> int:
     repo = repo_root(args.repo.resolve())
     print_progress(f"started checks for {repo}")
     report = make_report(repo)
+    report.findings = merge_findings(report.findings)
     lock = acquire_repo_lock(repo)
     try:
         (checked_map, added, removed), elapsed = timed_call(

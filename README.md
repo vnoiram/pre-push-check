@@ -68,8 +68,10 @@ repository's `.gitignore` automatically. This is the one exception to the report
 the tool always maintains this file so persistent false positives and previous clean-pass cache
 state don't block `git push` forever.
 
-Each finding is fingerprinted from its `kind` + `location` (`file:line`) + `message` + the actual
-matched content (e.g. the literal source line a secret/debug/local-path regex matched). The table
+Each finding is fingerprinted from its `kind` + `message` + the actual matched content (e.g. the
+literal source line a secret/debug/local-path regex matched). The location is deliberately *not*
+part of the fingerprint when there is matched content; for findings without content, only the file
+(not the line number) is used. The table
 records that matched content too, so a row reads like:
 
 ```
@@ -84,11 +86,13 @@ the box to `[x]` to mark a row as a false positive; on the next run that row mov
 ignored table, that exact finding is excluded from the report, and it no longer counts toward the
 Blocker verdict.
 
-Because the fingerprint includes the line number and the matched content, moving code so the line
-shifts, or editing that same line to a different value, produces a new fingerprint and the finding
-reappears (unchecked) rather than staying silently suppressed. This is intentional: it favors
-re-review over silently trusting a stale suppression — checking off a `foobar.yaml:1` false
-positive does not exempt a real secret introduced later at that same line.
+Because the fingerprint is based on the matched content rather than its position, moving code so
+the line shifts does not make a checked-off finding reappear. Editing the matched line to a
+different value still produces a new fingerprint and the finding comes back unchecked.
+
+Findings with the same fingerprint are merged into a single row/report entry whose location lists
+every occurrence (`[x3] a.rb:1, a.rb:9, b.rb:3`, truncated after 10). Checking that one row
+suppresses all identical occurrences, including ones added later in other files.
 
 Rows for findings that no longer occur (fixed in code, so the same fingerprint is not produced by
 the current run) are removed automatically on the next run, keeping the table limited to findings
@@ -96,7 +100,7 @@ that are still present. If every row is removed, the file itself is deleted.
 
 Findings with real content point at the specific thing that triggered them — `dirty-worktree` lists
 the actual changed paths (e.g. `a.py, b.py`) and a failed `gofmt -l` lists the actual unformatted Go
-files — so their location/fingerprint changes whenever the underlying content changes. Checking one
+files — so their fingerprint changes whenever the underlying content changes. Checking one
 off only suppresses that exact set; a different dirty file or a different unformatted file produces
 a new fingerprint and is reported again. `dirty-worktree` is reported as `Note` rather than
 `Warning` since it should stay visible every run rather than invite a one-time dismissal.
